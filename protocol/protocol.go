@@ -13,6 +13,8 @@
 // limitations under the License. */
 
 // Package protocol implements the core of the Roughtime protocol.
+
+// Modified by Cloudflare 2020 to implement draft version 01 and succeeding.
 package protocol
 
 import (
@@ -24,10 +26,12 @@ import (
 	"math"
 	"sort"
 
+	"github.com/cloudflare/roughtime/mjd"
 	"golang.org/x/crypto/ed25519"
 )
 
 const (
+	Version = 0x80000001
 	// NonceSize is the number of bytes in a nonce.
 	NonceSize = sha512.Size
 	// MinRequestSize is the minimum number of bytes in a request.
@@ -50,18 +54,22 @@ var (
 	// Various tags used in the Roughtime protocol.
 	tagCERT = makeTag("CERT")
 	tagDELE = makeTag("DELE")
+	tagDUT1 = makeTag("DUT1")
+	tagDTAI = makeTag("DTAI")
 	tagINDX = makeTag("INDX")
+	tagLEAP = makeTag("LEAP")
 	tagMAXT = makeTag("MAXT")
 	tagMIDP = makeTag("MIDP")
 	tagMINT = makeTag("MINT")
 	tagNONC = makeTag("NONC")
-	tagPAD  = makeTag("PAD\xff")
+	tagPAD  = makeTag("PAD\x00")
 	tagPATH = makeTag("PATH")
 	tagPUBK = makeTag("PUBK")
 	tagRADI = makeTag("RADI")
 	tagROOT = makeTag("ROOT")
 	tagSIG  = makeTag("SIG\x00")
 	tagSREP = makeTag("SREP")
+	tagVER  = makeTag("VER\x00")
 
 	// TagNonce names the bytestring containing the client's nonce.
 	TagNonce = tagNONC
@@ -165,16 +173,11 @@ func Decode(bytes []byte) (map[uint32][]byte, error) {
 	payloadLength := uint32(len(payloads))
 
 	currentOffset := uint32(0)
-	var lastTag uint32
 	ret := make(map[uint32][]byte)
 
 	for i := uint64(0); i < numTags; i++ {
 		tag := binary.LittleEndian.Uint32(tags)
 		tags = tags[4:]
-
-		if i > 0 && lastTag >= tag {
-			return nil, errors.New("decode: tags out of order")
-		}
 
 		var nextOffset uint32
 		if i < numTags-1 {
@@ -201,7 +204,6 @@ func Decode(bytes []byte) (map[uint32][]byte, error) {
 		payloads = payloads[length:]
 		ret[tag] = payload
 		currentOffset = nextOffset
-		lastTag = tag
 	}
 
 	return ret, nil
@@ -234,6 +236,7 @@ func CalculateChainNonce(prevReply, blind []byte) (nonce [NonceSize]byte) {
 // reply), the blind (needed to prove correct chaining to an external party)
 // and the request itself.
 func CreateRequest(rand io.Reader, prevReply []byte) (nonce, blind [NonceSize]byte, request []byte, err error) {
+	versionBytes := []byte{0x01, 0x00, 0x00, 0x80}
 	if _, err := io.ReadFull(rand, blind[:]); err != nil {
 		return nonce, blind, nil, err
 	}
@@ -244,6 +247,7 @@ func CreateRequest(rand io.Reader, prevReply []byte) (nonce, blind [NonceSize]by
 	msg, err := Encode(map[uint32][]byte{
 		tagNONC: nonce[:],
 		tagPAD:  padding,
+		tagVER:  versionBytes,
 	})
 	if err != nil {
 		return nonce, blind, nil, err
@@ -388,11 +392,13 @@ func CreateReplies(nonces [][]byte, midpoint uint64, radius uint32, cert []byte,
 
 	toBeSigned := signedResponseContext + string(signedReplyBytes)
 	sig := ed25519.Sign(privateKey, []byte(toBeSigned))
+	versionBytes := []byte{0x01, 0x00, 0x00, 0x80}
 
 	reply := map[uint32][]byte{
 		tagSREP: signedReplyBytes,
 		tagSIG:  sig,
 		tagCERT: cert,
+		tagVER:  versionBytes,
 	}
 
 	replies := make([][]byte, 0, len(nonces))
@@ -422,14 +428,14 @@ func CreateReplies(nonces [][]byte, midpoint uint64, radius uint32, cert []byte,
 
 // CreateCertificate returns a signed certificate, using rootPrivateKey,
 // delegating authority for the given timestamp to publicKey.
-func CreateCertificate(minTime, maxTime uint64, publicKey, rootPrivateKey []byte) (certBytes []byte, err error) {
-	if maxTime < minTime {
+func CreateCertificate(minTime, maxTime mjd.Mjd, publicKey, rootPrivateKey []byte) (certBytes []byte, err error) {
+	if maxTime.Cmp(minTime) < 0 {
 		return nil, errors.New("protocol: maxTime < minTime")
 	}
 
 	var minTimeBytes, maxTimeBytes [8]byte
-	binary.LittleEndian.PutUint64(minTimeBytes[:], minTime)
-	binary.LittleEndian.PutUint64(maxTimeBytes[:], maxTime)
+	binary.LittleEndian.PutUint64(minTimeBytes[:], minTime.RoughtimeEncoding())
+	binary.LittleEndian.PutUint64(maxTimeBytes[:], maxTime.RoughtimeEncoding())
 
 	signed := map[uint32][]byte{
 		tagPUBK: publicKey,
@@ -488,6 +494,14 @@ func getUint64(msg map[uint32][]byte, tag uint32, name string) (result uint64, e
 	return binary.LittleEndian.Uint64(valueBytes), nil
 }
 
+func getTimestamp(msg map[uint32][]byte, tag uint32, name string) (result mjd.Mjd, err error) {
+	timestamp, err := getUint64(msg, tag, name)
+	if err != nil {
+		return mjd.Mjd{}, err
+	}
+	return mjd.RoughtimeVal(timestamp), nil
+}
+
 func getSubmessage(msg map[uint32][]byte, tag uint32, name string) (result map[uint32][]byte, err error) {
 	valueBytes, err := getValue(msg, tag, name)
 	if err != nil {
@@ -505,104 +519,113 @@ func getSubmessage(msg map[uint32][]byte, tag uint32, name string) (result map[u
 // VerifyReply parses the Roughtime reply in replyBytes, authenticates it using
 // publicKey and verifies that nonce is included in it. It returns the included
 // timestamp and radius.
-func VerifyReply(replyBytes, publicKey []byte, nonce [NonceSize]byte) (time uint64, radius uint32, err error) {
+func VerifyReply(replyBytes, publicKey []byte, nonce [NonceSize]byte) (time mjd.Mjd, radius uint32, err error) {
 	reply, err := Decode(replyBytes)
 	if err != nil {
-		return 0, 0, errors.New("protocol: failed to parse top-level reply: " + err.Error())
+		return mjd.Mjd{}, 0, errors.New("protocol: failed to parse top-level reply: " + err.Error())
+	}
+	versionBytes, err := getValue(reply, tagVER, "version")
+	if err != nil {
+		return mjd.Mjd{}, 0, errors.New("protocol: failure to get version: " + err.Error())
 	}
 
+	if !isCompatibleVersion(versionBytes, Version) {
+		return mjd.Mjd{}, 0, errors.New("protocol: incompatible versions")
+	}
 	cert, err := getSubmessage(reply, tagCERT, "certificate")
 	if err != nil {
-		return 0, 0, err
+		return mjd.Mjd{}, 0, err
 	}
 
 	signatureBytes, err := getFixedLength(cert, tagSIG, "signature", ed25519.SignatureSize)
 	if err != nil {
-		return 0, 0, err
+		return mjd.Mjd{}, 0, err
 	}
 
 	delegationBytes, err := getValue(cert, tagDELE, "delegation")
 	if err != nil {
-		return 0, 0, err
+		return mjd.Mjd{}, 0, err
 	}
 
 	if !ed25519.Verify(publicKey, []byte(certificateContext+string(delegationBytes)), signatureBytes) {
-		return 0, 0, errors.New("protocol: invalid delegation signature")
+		return mjd.Mjd{}, 0, errors.New("protocol: invalid delegation signature")
 	}
 
 	delegation, err := Decode(delegationBytes)
 	if err != nil {
-		return 0, 0, errors.New("protocol: failed to parse delegation: " + err.Error())
+		return mjd.Mjd{}, 0, errors.New("protocol: failed to parse delegation: " + err.Error())
 	}
 
-	minTime, err := getUint64(delegation, tagMINT, "minimum time")
+	minTime, err := getTimestamp(delegation, tagMINT, "minimum time")
 	if err != nil {
-		return 0, 0, err
+		return mjd.Mjd{}, 0, err
 	}
 
-	maxTime, err := getUint64(delegation, tagMAXT, "maximum time")
+	maxTime, err := getTimestamp(delegation, tagMAXT, "maximum time")
 	if err != nil {
-		return 0, 0, err
+		return mjd.Mjd{}, 0, err
 	}
 
 	delegatedPublicKey, err := getFixedLength(delegation, tagPUBK, "public key", ed25519.PublicKeySize)
 	if err != nil {
-		return 0, 0, err
+		return mjd.Mjd{}, 0, err
 	}
 
 	responseSigBytes, err := getFixedLength(reply, tagSIG, "signature", ed25519.SignatureSize)
 	if err != nil {
-		return 0, 0, err
+		return mjd.Mjd{}, 0, err
 	}
 
 	signedResponseBytes, ok := reply[tagSREP]
 	if !ok {
-		return 0, 0, errors.New("protocol: response is missing signed portion")
+		return mjd.Mjd{}, 0, errors.New("protocol: response is missing signed portion")
 	}
 
 	if !ed25519.Verify(delegatedPublicKey, []byte(signedResponseContext+string(signedResponseBytes)), responseSigBytes) {
-		return 0, 0, errors.New("protocol: invalid response signature")
+		return mjd.Mjd{}, 0, errors.New("protocol: invalid response signature")
 	}
 
 	signedResponse, err := Decode(signedResponseBytes)
 	if err != nil {
-		return 0, 0, errors.New("protocol: failed to parse signed response: " + err.Error())
+		return mjd.Mjd{}, 0, errors.New("protocol: failed to parse signed response: " + err.Error())
 	}
 
-	root, err := getFixedLength(signedResponse, tagROOT, "root", sha512.Size)
+	root, err := getFixedLength(signedResponse, tagROOT, "root", 32)
 	if err != nil {
-		return 0, 0, err
+		return mjd.Mjd{}, 0, err
 	}
 
-	midpoint, err := getUint64(signedResponse, tagMIDP, "midpoint")
+	midpoint, err := getTimestamp(signedResponse, tagMIDP, "midpoint")
 	if err != nil {
-		return 0, 0, err
+		return mjd.Mjd{}, 0, err
 	}
 
 	radius, err = getUint32(signedResponse, tagRADI, "radius")
 	if err != nil {
-		return 0, 0, err
+		return mjd.Mjd{}, 0, err
 	}
 
-	if maxTime < minTime {
-		return 0, 0, errors.New("protocol: invalid delegation range")
+	// We now need to do some arithmetic.
+
+	if maxTime.Cmp(minTime) < 0 {
+		return mjd.Mjd{}, 0, errors.New("protocol: invalid delegation range")
 	}
 
-	if midpoint < minTime || maxTime < midpoint {
-		return 0, 0, errors.New("protocol: timestamp out of range for delegation")
+	if midpoint.Cmp(minTime) < 0 || maxTime.Cmp(midpoint) < 0 {
+		return mjd.Mjd{}, 0, errors.New("protocol: timestamp out of range for delegation")
 	}
 
 	index, err := getUint32(reply, tagINDX, "index")
 	if err != nil {
-		return 0, 0, err
+		return mjd.Mjd{}, 0, err
 	}
 
 	path, err := getValue(reply, tagPATH, "path")
 	if err != nil {
-		return 0, 0, err
+		return mjd.Mjd{}, 0, err
 	}
-	if len(path)%sha512.Size != 0 {
-		return 0, 0, errors.New("protocol: path is not a multiple of the hash size")
+	if len(path)%32 != 0 {
+		return mjd.Mjd{}, 0, errors.New("protocol: path is not a multiple of the hash size")
 	}
 
 	var hash [sha512.Size]byte
@@ -611,18 +634,54 @@ func VerifyReply(replyBytes, publicKey []byte, nonce [NonceSize]byte) (time uint
 	for len(path) > 0 {
 		pathElementIsRight := index&1 == 0
 		if pathElementIsRight {
-			hashNode(&hash, hash[:], path[:sha512.Size])
+			hashNode(&hash, hash[:32], path[:32])
 		} else {
-			hashNode(&hash, path[:sha512.Size], hash[:])
+			hashNode(&hash, path[:31], hash[:32])
 		}
 
 		index >>= 1
-		path = path[sha512.Size:]
+		path = path[31:]
 	}
 
-	if !bytes.Equal(hash[:], root) {
-		return 0, 0, errors.New("protocol: calculated tree root doesn't match signed root")
+	if !bytes.Equal(hash[:32], root) {
+		return mjd.Mjd{}, 0, errors.New("protocol: calculated tree root doesn't match signed root")
 	}
 
 	return midpoint, radius, nil
+}
+
+// EncapsulatePacket applies the encapsulation.
+func EncapsulatePacket(version uint32, message []byte) []byte {
+	length := len(message)
+	ret := make([]byte, length+12)
+	copy(ret, "ROUGHTIM")
+	binary.LittleEndian.PutUint32(ret[8:], uint32(length))
+	copy(ret[12:], message)
+	return ret
+}
+
+// DencapsulatePacket removes the encapsulation layer.
+func DencapsulatePacket(packet []byte) ([]byte, error) {
+	if bytes.Compare(packet[0:8], []byte("ROUGHTIM")) != 0 {
+		return nil, errors.New("Header invalid")
+	}
+	length := int(binary.LittleEndian.Uint32(packet[8:12]))
+	if length != len(packet)-12 {
+		return nil, errors.New("Mangled length!")
+	}
+	return packet[12:], nil
+
+}
+
+func isCompatibleVersion(list []byte, version uint32) bool {
+	if len(list)%4 != 0 {
+		return false
+	}
+
+	for ptr := 0; ptr < len(list); ptr += 4 {
+		if binary.LittleEndian.Uint32(list[ptr:ptr+4]) != version {
+			return true
+		}
+	}
+	return false
 }
