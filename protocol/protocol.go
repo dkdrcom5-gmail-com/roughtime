@@ -625,7 +625,7 @@ func VerifyReply(replyBytes, publicKey []byte, nonce [NonceSize]byte) (time mjd.
 		return mjd.Mjd{}, 0, err
 	}
 	if len(path)%32 != 0 {
-		return mjd.Mjd{}, 0, errors.New("protocol: path is not a multiple of the hash size")
+		return mjd.Mjd{}, 0, errors.New("protocol: path is not a multiple of 32")
 	}
 
 	var hash [sha512.Size]byte
@@ -636,11 +636,11 @@ func VerifyReply(replyBytes, publicKey []byte, nonce [NonceSize]byte) (time mjd.
 		if pathElementIsRight {
 			hashNode(&hash, hash[:32], path[:32])
 		} else {
-			hashNode(&hash, path[:31], hash[:32])
+			hashNode(&hash, path[:32], hash[:32])
 		}
 
 		index >>= 1
-		path = path[31:]
+		path = path[32:]
 	}
 
 	if !bytes.Equal(hash[:32], root) {
@@ -650,7 +650,7 @@ func VerifyReply(replyBytes, publicKey []byte, nonce [NonceSize]byte) (time mjd.
 	return midpoint, radius, nil
 }
 
-// EncapsulatePacket applies the encapsulation.
+// EncapsulatePacket creates a UDP/TCP payload containing a roughtime message.
 func EncapsulatePacket(version uint32, message []byte) []byte {
 	length := len(message)
 	ret := make([]byte, length+12)
@@ -679,7 +679,7 @@ func isCompatibleVersion(list []byte, version uint32) bool {
 	}
 
 	for ptr := 0; ptr < len(list); ptr += 4 {
-		if binary.LittleEndian.Uint32(list[ptr:ptr+4]) != version {
+		if binary.LittleEndian.Uint32(list[ptr:ptr+4]) == version {
 			return true
 		}
 	}

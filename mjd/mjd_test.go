@@ -6,7 +6,7 @@ import (
 
 func TestMJD(t *testing.T) {
 	result := Now()
-	if result.Day() < 40587 {
+	if result.Day() < 40587+365*(2020-1970) {
 		t.Fatal("Day seems wrong")
 	}
 
